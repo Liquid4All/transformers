@@ -17,10 +17,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import time
 from collections.abc import Callable
 from typing import Any, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -43,6 +46,23 @@ if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
     causal_conv1d_fn, causal_conv1d_update = None, None
+
+# optional deps only needed when optimized=True
+try:
+    import transformer_engine.pytorch as te
+    from megatron.core.process_groups_config import ModelCommProcessGroups as _ModelCommProcessGroups
+    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher as _Dispatcher
+    from megatron.core.transformer.transformer_config import TransformerConfig as _MCoreCfg
+    _MEGATRON_OK = True
+except Exception:
+    _MEGATRON_OK = False
+
+def make_pg_collection_ep_tp_singleton():
+    rank = dist.get_rank()
+    ep = dist.new_group(ranks=[rank])
+    tp_ep = dist.new_group(ranks=[rank])
+    tp = dist.new_group(ranks=[rank])
+    return _ModelCommProcessGroups(ep=ep, tp_ep=tp_ep, expt_tp=tp)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -143,40 +163,213 @@ class Lfm2MoeMLP(nn.Module):
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-
 class Lfm2MoeExperts(nn.ModuleList):
     """
-    ModuleList of experts.
+    ModuleList of experts (default path), OR a grouped MLP fast path (optimized=True).
     """
-
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
-        for _ in range(config.num_experts):
-            self.append(Lfm2MoeMLP(config, intermediate_size=config.moe_intermediate_size))
+        self.hidden_size = config.hidden_size
+        self.ffn_hidden = config.moe_intermediate_size
+
+        # ### DEBUG: toggle (config or env)
+        self.moe_debug = bool(getattr(config, "moe_debug", False) or int(os.environ.get("LFM2_MOE_DEBUG", "0")))
+
+        self.moe_use_optimized = getattr(config, "moe_use_optimized", False)
+        self.moe_top_k = getattr(config, "num_experts_per_tok", 2)
+        self.moe_capacity_factor = getattr(config, "moe_capacity_factor", 1.25)
+        self.moe_dropless = getattr(config, "moe_dropless", True)  # True => pad to capacity
+
+        # ... (unchanged checks for _MEGATRON_OK, cuda+dist)
+
+        if self.moe_use_optimized:
+            # --- Megatron dispatcher setup (unchanged) ---
+            self._mcore_cfg = _MCoreCfg(
+                hidden_size=self.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_layers=max(config.num_hidden_layers, 1),
+                num_moe_experts=self.num_experts,
+                moe_ffn_hidden_size=self.ffn_hidden,
+                ffn_hidden_size=self.ffn_hidden,
+                add_bias_linear=False,
+                moe_router_topk=self.moe_top_k,
+                moe_expert_capacity_factor=self.moe_capacity_factor,
+                moe_pad_expert_input_to_capacity=self.moe_dropless,
+                moe_token_dispatcher_type="alltoall",
+            )
+            self._dispatcher = _Dispatcher(
+                num_local_experts=self.num_experts,
+                local_expert_indices=list(range(self.num_experts)),
+                config=self._mcore_cfg,
+                model_comm_pgs=make_pg_collection_ep_tp_singleton(),
+            )
+            # --- Grouped MLP (unchanged) ---
+            self._fc_up = te.GroupedLinear(
+                num_gemms=self.num_experts, in_features=self.hidden_size, out_features=self.ffn_hidden, bias=False
+            )
+            self._fc_gate = te.GroupedLinear(
+                num_gemms=self.num_experts, in_features=self.hidden_size, out_features=self.ffn_hidden, bias=False
+            )
+            self._fc_down = te.GroupedLinear(
+                num_gemms=self.num_experts, in_features=self.ffn_hidden, out_features=self.hidden_size, bias=False
+            )
+            self._act = F.silu
+
+        if not self.moe_use_optimized:
+            config.moe_use_optimized = False
+            for _ in range(self.num_experts):
+                self.append(Lfm2MoeMLP(config, intermediate_size=self.ffn_hidden))
+
+    # ### DEBUG helpers
+    def _rank(self):
+        if dist.is_available() and dist.is_initialized():
+            try:
+                return dist.get_rank()
+            except Exception:
+                pass
+        return 0
+
+    def _log(self, msg, t=None):
+        if not self.moe_debug:
+            return
+        prefix = f"[MOE|opt|rank{self._rank()}] "
+        if t is None:
+            print(prefix + msg)
+            return
+        # t can be a tensor or list
+        try:
+            if isinstance(t, torch.Tensor):
+                shape = list(t.shape)
+                dtype = str(t.dtype)
+                device = str(t.device)
+                with torch.no_grad():
+                    flat = t.reshape(-1)
+                    sample = flat[:4].detach().cpu()
+                    mn = float(flat.min().detach().cpu()) if flat.numel() else 0.0
+                    mx = float(flat.max().detach().cpu()) if flat.numel() else 0.0
+                print(f"{prefix}{msg} | shape={shape} dtype={dtype} device={device} "
+                      f"sample={sample.tolist()} range=[{mn:.4g},{mx:.4g}]")
+            elif isinstance(t, (list, tuple)):
+                print(f"{prefix}{msg} | list_len={len(t)} first5={t[:5]}")
+            else:
+                print(f"{prefix}{msg}: {t}")
+        except Exception as e:
+            print(prefix + f"{msg} | <debug error: {e}>")
+
+    from contextlib import contextmanager
+    @contextmanager
+    def _timer(self, tag):
+        if not self.moe_debug:
+            yield
+            return
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            dt = (time.time() - t0) * 1000.0
+            self._log(f"{tag} took {dt:.2f} ms")
+
+    @torch.no_grad()
+    def _capacity(self, tokens: int) -> int:
+        per_exp = (tokens * self.moe_top_k + self.num_experts - 1) // self.num_experts
+        cap = int(self.moe_capacity_factor * per_exp)
+        return (cap + 7) // 8 * 8  # align a bit
 
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states: (batch_size * sequence_length, hidden_dim)
-            selected_experts: (batch_size * sequence_length, top_k)
-            routing_weights: (batch_size * sequence_length, top_k)
-        Returns:
-            (batch_size * sequence_length, hidden_dim)
-        """
-        final_hidden_states = torch.zeros_like(hidden_states)
-        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+        if not self.moe_use_optimized:
+            self._log("slow path")
+            # (unchanged slow path)
+            final_hidden_states = torch.zeros_like(hidden_states)
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            self._log("expert_hit", expert_hit)
+            self._log("expert_mask", expert_mask)
+            self._log("top_k_weights", top_k_weights)
+            self._log("hidden_states", hidden_states)
+            for expert_idx in expert_hit:
+                idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+                current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
+                current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                self._log("current_hidden_states", current_hidden_states)
+                self._log("final_hidden_states", final_hidden_states)
+            return final_hidden_states
 
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
-            current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        return final_hidden_states
+        # ---- optimized path ----
+        tokens = hidden_states.shape[0]
+        if tokens == 0:
+            return hidden_states
 
+        self._log("forward() start",)
+        self._log("hidden_states", hidden_states)
+        self._log("top_k_index", top_k_index)
+        self._log("top_k_weights", top_k_weights)
+
+        with self._timer("build routing/probs"):
+            routing_map = torch.zeros((tokens, self.num_experts),
+                                      dtype=torch.uint8, device=hidden_states.device)
+            routing_map.scatter_(1, top_k_index, 1)
+            routing_map = routing_map.bool()
+            probs = torch.zeros((tokens, self.num_experts),
+                                dtype=top_k_weights.dtype, device=hidden_states.device)
+            probs.scatter_(1, top_k_index, top_k_weights)
+            self._log("routing_map (bool) sum", routing_map.sum())
+            self._log("probs row-sum ~ top_k?", probs.sum(dim=1))
+
+        with self._timer("dispatch preprocess"):
+            permuted_tokens, permuted_probs = self._dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs
+            )
+            self._log("permuted_tokens", permuted_tokens)
+            self._log("permuted_probs", permuted_probs)
+
+        with self._timer("token_dispatch (alltoall)"):
+            dispatched_tokens, dispatched_probs = self._dispatcher.token_dispatch(
+                permuted_tokens, permuted_probs
+            )
+            self._log("dispatched_tokens", dispatched_tokens)
+            self._log("dispatched_probs", dispatched_probs)
+
+        with self._timer("dispatch postprocess"):
+            expert_tokens, tokens_per_expert, dispatched_probs = self._dispatcher.dispatch_postprocess(dispatched_tokens, dispatched_probs)
+            self._log("expert_tokens", expert_tokens)
+            self._log("tokens_per_expert", tokens_per_expert)
+            self._log("dispatched_probs", dispatched_probs)
+
+        splits = tokens_per_expert.tolist()
+        self._log("splits", splits)
+
+        with self._timer("fc_up + fc_gate + act*gate"):
+            up = self._fc_up(expert_tokens, m_splits=splits)
+            gate = self._fc_gate(expert_tokens, m_splits=splits)
+            self._log("up", up)
+            self._log("gate", gate)
+            expert_hidden = self._act(up) * gate
+            self._log("expert_hidden", expert_hidden)
+
+        with self._timer("fc_down"):
+            out_packed = self._fc_down(expert_hidden, m_splits=splits)
+            self._log("out_packed", out_packed)
+            # Apply router weights per packed slot (zeros on padded capacity => no-op)
+            # dispatched_probs shape: [packed_len], out_packed: [packed_len, hidden]
+            out_packed = out_packed * dispatched_probs.to(out_packed.dtype).unsqueeze(-1)
+            self._log("out_packed (weighted)", out_packed)
+
+        with self._timer("combine"):
+            combined = self._dispatcher.combine_preprocess(out_packed)
+            self._log("combine_preprocess(out_packed)", combined)
+            combined = self._dispatcher.token_combine(combined)
+            self._log("token_combine(combined)", combined)
+            out = self._dispatcher.combine_postprocess(combined)
+            self._log("combine_postprocess -> out", out)
+
+        self._log("forward() end")
+        return out
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
