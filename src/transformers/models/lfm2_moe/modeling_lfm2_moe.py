@@ -178,12 +178,19 @@ class Lfm2MoeExperts(nn.ModuleList):
 
         self.moe_use_optimized = getattr(config, "moe_use_optimized", False)
         self.moe_top_k = getattr(config, "num_experts_per_tok", 2)
-        self.moe_capacity_factor = getattr(config, "moe_capacity_factor", 1.25)
-        self.moe_dropless = getattr(config, "moe_dropless", True)  # True => pad to capacity
+        self.moe_capacity_factor = getattr(config, "moe_capacity_factor", 1.0)
+        self.moe_dropless = getattr(config, "moe_dropless", False)  # True => pad to capacity
+        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))
 
-        # ... (unchanged checks for _MEGATRON_OK, cuda+dist)
 
         if self.moe_use_optimized:
+            if not _MEGATRON_OK:
+                raise RuntimeError("Megatron dispatcher is not available. Please install Megatron.")
+            if not torch.cuda.is_available() or not dist.is_available():
+                raise RuntimeError("Megatron dispatcher requires CUDA and dist.")
+            
+            pgs = make_pg_collection_ep_tp_singleton()
+
             # --- Megatron dispatcher setup (unchanged) ---
             self._mcore_cfg = _MCoreCfg(
                 hidden_size=self.hidden_size,
@@ -202,7 +209,7 @@ class Lfm2MoeExperts(nn.ModuleList):
                 num_local_experts=self.num_experts,
                 local_expert_indices=list(range(self.num_experts)),
                 config=self._mcore_cfg,
-                model_comm_pgs=make_pg_collection_ep_tp_singleton(),
+                model_comm_pgs=pgs,
             )
             # --- Grouped MLP (unchanged) ---
             self._fc_up = te.GroupedLinear(
@@ -216,11 +223,16 @@ class Lfm2MoeExperts(nn.ModuleList):
             )
             self._act = F.silu
 
+            if self.moe_fp8_enable:
+                self.fp8_padding = te.Fp8Padding(num_gemms=self.num_experts)
+                self.fp8_unpadding = te.Fp8Unpadding(num_gemms=self.num_experts)
+            
         if not self.moe_use_optimized:
             config.moe_use_optimized = False
             for _ in range(self.num_experts):
                 self.append(Lfm2MoeMLP(config, intermediate_size=self.ffn_hidden))
-
+        
+        
     # ### DEBUG helpers
     def _rank(self):
         if dist.is_available() and dist.is_initialized():
@@ -344,21 +356,35 @@ class Lfm2MoeExperts(nn.ModuleList):
         splits = tokens_per_expert.tolist()
         self._log("splits", splits)
 
-        with self._timer("fc_up + fc_gate + act*gate"):
-            up = self._fc_up(expert_tokens, m_splits=splits)
-            gate = self._fc_gate(expert_tokens, m_splits=splits)
-            self._log("up", up)
-            self._log("gate", gate)
-            expert_hidden = self._act(up) * gate
-            self._log("expert_hidden", expert_hidden)
+        def _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits):
+            if self.moe_fp8_enable:
+                # Use FP8 autocast just for the expert compute
+                with te.fp8_autocast(enabled=True):
+                    original_splits = splits
+                    tokens_padded, splits = self.fp8_padding(expert_tokens, splits)
+                    dispatched_probs_padded, _ = self.fp8_padding(dispatched_probs.unsqueeze(-1), original_splits)
+                    up = self._fc_up(tokens_padded, m_splits=splits)
+                    gate = self._fc_gate(tokens_padded, m_splits=splits)
+                    hidden = self._act(up) * gate
+                    out_fp8 = self._fc_down(hidden, m_splits=splits)
+                    out_fp8 = out_fp8 * dispatched_probs_padded
+                    out = self.fp8_unpadding(out_fp8, original_splits)
+            else:
+                up = self._fc_up(expert_tokens, m_splits=splits)
+                gate = self._fc_gate(expert_tokens, m_splits=splits)
+                hidden = self._act(up) * gate
+                out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.to(out.dtype).unsqueeze(-1)
 
-        with self._timer("fc_down"):
-            out_packed = self._fc_down(expert_hidden, m_splits=splits)
-            self._log("out_packed", out_packed)
-            # Apply router weights per packed slot (zeros on padded capacity => no-op)
-            # dispatched_probs shape: [packed_len], out_packed: [packed_len, hidden]
-            out_packed = out_packed * dispatched_probs.to(out_packed.dtype).unsqueeze(-1)
-            self._log("out_packed (weighted)", out_packed)
+            return out
+
+        if self.training and torch.is_grad_enabled():
+            with self._timer("experts (ckpt, fp8-aware)"):
+                out_packed = torch.utils.checkpoint.checkpoint(
+                    _experts_core_fp8_aware, expert_tokens, dispatched_probs, splits, use_reentrant=True
+                )
+        else:
+            with self._timer("experts (no-ckpt, fp8-aware)"):
+                out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits)
 
         with self._timer("combine"):
             combined = self._dispatcher.combine_preprocess(out_packed)

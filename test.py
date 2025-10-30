@@ -1,5 +1,6 @@
 import os
 import re
+import time
 
 import torch
 import torch.distributed as dist
@@ -188,25 +189,35 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2-8B-A1B")
 
     # Generate answer
-    prompt = "What is C. elegans?"
+    prompt = "tell me history of poland"
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
         return_tensors="pt",
         tokenize=True,
     ).to(local_rank)
+    attempts = 10
+    start_time = time.time()
+    for _ in range(attempts):
+        output_opt = model.generate(
+            input_ids,
+                do_sample=False,
+                max_new_tokens=256,
+            )
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
+    print(f"Time per attempt: {(end_time - start_time) / attempts} seconds")
 
-    output_opt = model.generate(
-        input_ids,
-        do_sample=False,
-        max_new_tokens=100,
-    )
-
-    output_ref = ref_model.generate(
-        input_ids,
-        do_sample=False,
-        max_new_tokens=100,
-    )
+    start_time = time.time()
+    for _ in range(attempts):
+        output_ref = ref_model.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=256,
+        )
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
+    print(f"Time per attempt: {(end_time - start_time) / attempts} seconds")
 
     print(f"Optimized: {tokenizer.decode(output_opt[0], skip_special_tokens=True)} \n")
     print(f"Reference: {tokenizer.decode(output_ref[0], skip_special_tokens=True)}")
