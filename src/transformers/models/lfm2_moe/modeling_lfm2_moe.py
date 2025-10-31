@@ -156,12 +156,20 @@ class Lfm2MoeMLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.w1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.w3 = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))    
+
+        if self.moe_fp8_enable:
+            self.w1 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
+            self.w3 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
+            self.w2 = te.Linear(in_features=self.intermediate_size, out_features=self.hidden_size, bias=False)
+        else:
+            self.w1 = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.w3 = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        with te.fp8_autocast(enabled=self.moe_fp8_enable):
+            return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Lfm2MoeExperts(nn.ModuleList):
     """
