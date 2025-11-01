@@ -320,49 +320,49 @@ class Lfm2MoeExperts(nn.ModuleList):
                 self._log("final_hidden_states", final_hidden_states)
             return final_hidden_states
 
-        # ---- optimized path ----
-        tokens = hidden_states.shape[0]
-        if tokens == 0:
-            return hidden_states
+        # # ---- optimized path ----
+        # tokens = hidden_states.shape[0]
+        # if tokens == 0:
+        #     return hidden_states
 
-        self._log("forward() start",)
-        self._log("hidden_states", hidden_states)
-        self._log("top_k_index", top_k_index)
-        self._log("top_k_weights", top_k_weights)
+        # self._log("forward() start",)
+        # self._log("hidden_states", hidden_states)
+        # self._log("top_k_index", top_k_index)
+        # self._log("top_k_weights", top_k_weights)
 
-        with self._timer("build routing/probs"):
-            routing_map = torch.zeros((tokens, self.num_experts),
-                                      dtype=torch.uint8, device=hidden_states.device)
-            routing_map.scatter_(1, top_k_index, 1)
-            routing_map = routing_map.bool()
-            probs = torch.zeros((tokens, self.num_experts),
-                                dtype=top_k_weights.dtype, device=hidden_states.device)
-            probs.scatter_(1, top_k_index, top_k_weights)
-            self._log("routing_map (bool) sum", routing_map.sum())
-            self._log("probs row-sum ~ top_k?", probs.sum(dim=1))
+        # with self._timer("build routing/probs"):
+        #     routing_map = torch.zeros((tokens, self.num_experts),
+        #                               dtype=torch.uint8, device=hidden_states.device)
+        #     routing_map.scatter_(1, top_k_index, 1)
+        #     routing_map = routing_map.bool()
+        #     probs = torch.zeros((tokens, self.num_experts),
+        #                         dtype=top_k_weights.dtype, device=hidden_states.device)
+        #     probs.scatter_(1, top_k_index, top_k_weights)
+        #     self._log("routing_map (bool) sum", routing_map.sum())
+        #     self._log("probs row-sum ~ top_k?", probs.sum(dim=1))
 
-        with self._timer("dispatch preprocess"):
-            permuted_tokens, permuted_probs = self._dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs
-            )
-            self._log("permuted_tokens", permuted_tokens)
-            self._log("permuted_probs", permuted_probs)
+        # with self._timer("dispatch preprocess"):
+        #     permuted_tokens, permuted_probs = self._dispatcher.dispatch_preprocess(
+        #         hidden_states, routing_map, probs
+        #     )
+        #     self._log("permuted_tokens", permuted_tokens)
+        #     self._log("permuted_probs", permuted_probs)
 
-        with self._timer("token_dispatch (alltoall)"):
-            dispatched_tokens, dispatched_probs = self._dispatcher.token_dispatch(
-                permuted_tokens, permuted_probs
-            )
-            self._log("dispatched_tokens", dispatched_tokens)
-            self._log("dispatched_probs", dispatched_probs)
+        # with self._timer("token_dispatch (alltoall)"):
+        #     dispatched_tokens, dispatched_probs = self._dispatcher.token_dispatch(
+        #         permuted_tokens, permuted_probs
+        #     )
+        #     self._log("dispatched_tokens", dispatched_tokens)
+        #     self._log("dispatched_probs", dispatched_probs)
 
-        with self._timer("dispatch postprocess"):
-            expert_tokens, tokens_per_expert, dispatched_probs = self._dispatcher.dispatch_postprocess(dispatched_tokens, dispatched_probs)
-            self._log("expert_tokens", expert_tokens)
-            self._log("tokens_per_expert", tokens_per_expert)
-            self._log("dispatched_probs", dispatched_probs)
+        # with self._timer("dispatch postprocess"):
+        #     expert_tokens, tokens_per_expert, dispatched_probs = self._dispatcher.dispatch_postprocess(dispatched_tokens, dispatched_probs)
+        #     self._log("expert_tokens", expert_tokens)
+        #     self._log("tokens_per_expert", tokens_per_expert)
+        #     self._log("dispatched_probs", dispatched_probs)
 
-        splits = tokens_per_expert.tolist()
-        self._log("splits", splits)
+        # splits = tokens_per_expert.tolist()
+        # self._log("splits", splits)
 
         def _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits):
             if self.moe_fp8_enable:
@@ -385,24 +385,59 @@ class Lfm2MoeExperts(nn.ModuleList):
 
             return out
 
+        # if self.training and torch.is_grad_enabled():
+        #     with self._timer("experts (ckpt, fp8-aware)"):
+        #         out_packed = torch.utils.checkpoint.checkpoint(
+        #             _experts_core_fp8_aware, expert_tokens, dispatched_probs, splits, use_reentrant=True
+        #         )
+        # else:
+        #     with self._timer("experts (no-ckpt, fp8-aware)"):
+        #         out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits)
+
+        # with self._timer("combine"):
+        #     combined = self._dispatcher.combine_preprocess(out_packed)
+        #     self._log("combine_preprocess(out_packed)", combined)
+        #     combined = self._dispatcher.token_combine(combined)
+        #     self._log("token_combine(combined)", combined)
+        #     out = self._dispatcher.combine_postprocess(combined)
+        #     self._log("combine_postprocess -> out", out)
+
+        # self._log("forward() end")
+        # Replace the block that builds `routing_map`/`probs` and the dispatcher calls.
+        # This sparse local routing keeps grouped GEMM efficiency and avoids [tokens, num_experts] tensors.
+
+        tokens = hidden_states.shape[0]
+        top_k = top_k_index.shape[1]
+        device = hidden_states.device
+
+        # Flatten token->expert assignments
+        tok_idx = torch.arange(tokens, device=device).repeat_interleave(top_k)
+        exp_idx = top_k_index.reshape(-1)
+        prob_flat = top_k_weights.reshape(-1)
+
+        # Group by expert (stable to preserve order inside each expert)
+        order = torch.argsort(exp_idx, stable=True)
+        tok_idx_sorted = tok_idx.index_select(0, order)
+        probs_sorted = prob_flat.index_select(0, order)
+
+        # Per-expert counts for GroupedLinear
+        tokens_per_expert = torch.bincount(exp_idx, minlength=self.num_experts).tolist()
+
+        # Build packed expert input
+        expert_tokens = hidden_states.index_select(0, tok_idx_sorted).contiguous()
+        dispatched_probs = probs_sorted  # already aligned with expert_tokens
+
+        # Run experts with the existing fp8-aware core
         if self.training and torch.is_grad_enabled():
-            with self._timer("experts (ckpt, fp8-aware)"):
-                out_packed = torch.utils.checkpoint.checkpoint(
-                    _experts_core_fp8_aware, expert_tokens, dispatched_probs, splits, use_reentrant=True
-                )
+            out_packed = torch.utils.checkpoint.checkpoint(
+                _experts_core_fp8_aware, expert_tokens, dispatched_probs, tokens_per_expert, use_reentrant=True
+            )
         else:
-            with self._timer("experts (no-ckpt, fp8-aware)"):
-                out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits)
+            out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, tokens_per_expert)
 
-        with self._timer("combine"):
-            combined = self._dispatcher.combine_preprocess(out_packed)
-            self._log("combine_preprocess(out_packed)", combined)
-            combined = self._dispatcher.token_combine(combined)
-            self._log("token_combine(combined)", combined)
-            out = self._dispatcher.combine_postprocess(combined)
-            self._log("combine_postprocess -> out", out)
-
-        self._log("forward() end")
+        # Combine back to token space (sum contributions from top-k experts)
+        out = torch.zeros_like(hidden_states)
+        out.index_add_(0, tok_idx_sorted, out_packed.to(out.dtype))
         return out
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
@@ -1060,3 +1095,4 @@ class Lfm2MoeForCausalLM(Lfm2MoePreTrainedModel, GenerationMixin):
 
 
 __all__ = ["Lfm2MoeForCausalLM", "Lfm2MoeModel", "Lfm2MoePreTrainedModel"]
+                                                                                                   

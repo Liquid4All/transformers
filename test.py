@@ -175,6 +175,7 @@ def main():
     config.moe_dropless = True
     config.moe_capacity_factor = 1.25
     config.moe_debug = DEBUG
+    config.moe_fp8_enable = False
 
     model = Lfm2MoeForCausalLM.from_pretrained("/lambdafs/anna/lfm2-8b-a1b-te-grouped", torch_dtype=torch.bfloat16, device_map=local_rank, config=config)
     # port_hf_moe_to_te_grouped(model, "LiquidAI/LFM2-8B-A1B")
