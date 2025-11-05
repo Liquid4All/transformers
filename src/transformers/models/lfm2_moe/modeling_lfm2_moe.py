@@ -158,7 +158,7 @@ class Lfm2MoeMLP(nn.Module):
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))    
 
-        if self.moe_fp8_enable:
+        if self.moe_fp8_enable and self.training:
             self.w1 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
             self.w3 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
             self.w2 = te.Linear(in_features=self.intermediate_size, out_features=self.hidden_size, bias=False)
@@ -168,7 +168,7 @@ class Lfm2MoeMLP(nn.Module):
             self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        with te.fp8_autocast(enabled=self.moe_fp8_enable):
+        with te.fp8_autocast(enabled=self.moe_fp8_enable and self.training):
             return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Lfm2MoeExperts(nn.ModuleList):
@@ -231,7 +231,7 @@ class Lfm2MoeExperts(nn.ModuleList):
             )
             self._act = F.silu
 
-            if self.moe_fp8_enable:
+            if self.moe_fp8_enable and self.training:
                 self.fp8_padding = te.Fp8Padding(num_gemms=self.num_experts)
                 self.fp8_unpadding = te.Fp8Unpadding(num_gemms=self.num_experts)
             
@@ -365,7 +365,7 @@ class Lfm2MoeExperts(nn.ModuleList):
         # self._log("splits", splits)
 
         def _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits):
-            if self.moe_fp8_enable:
+            if self.moe_fp8_enable and self.training:
                 # Use FP8 autocast just for the expert compute
                 with te.fp8_autocast(enabled=True):
                     original_splits = splits
@@ -381,7 +381,7 @@ class Lfm2MoeExperts(nn.ModuleList):
                 up = self._fc_up(expert_tokens, m_splits=splits)
                 gate = self._fc_gate(expert_tokens, m_splits=splits)
                 hidden = self._act(up) * gate
-                out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.to(out.dtype).unsqueeze(-1)
+                out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.unsqueeze(-1)
 
             return out
 
@@ -1095,4 +1095,3 @@ class Lfm2MoeForCausalLM(Lfm2MoePreTrainedModel, GenerationMixin):
 
 
 __all__ = ["Lfm2MoeForCausalLM", "Lfm2MoeModel", "Lfm2MoePreTrainedModel"]
-                                                                                                   

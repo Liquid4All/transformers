@@ -190,7 +190,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2-8B-A1B")
 
     # Generate answer
-    prompt = "tell me history of poland"
+    prompt = "What is the capital of Poland?"
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
