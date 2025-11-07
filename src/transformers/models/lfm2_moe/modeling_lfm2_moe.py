@@ -53,9 +53,11 @@ try:
     from megatron.core.process_groups_config import ModelCommProcessGroups as _ModelCommProcessGroups
     from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher as _Dispatcher
     from megatron.core.transformer.transformer_config import TransformerConfig as _MCoreCfg
+
     _MEGATRON_OK = True
 except Exception:
     _MEGATRON_OK = False
+
 
 def make_pg_collection_ep_tp_singleton():
     rank = dist.get_rank()
@@ -156,7 +158,7 @@ class Lfm2MoeMLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))    
+        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))
 
         if self.moe_fp8_enable and self.training:
             self.w1 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
@@ -171,10 +173,12 @@ class Lfm2MoeMLP(nn.Module):
         with te.fp8_autocast(enabled=self.moe_fp8_enable and self.training):
             return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+
 class Lfm2MoeExperts(nn.ModuleList):
     """
     ModuleList of experts (default path), OR a grouped MLP fast path (optimized=True).
     """
+
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
@@ -189,14 +193,14 @@ class Lfm2MoeExperts(nn.ModuleList):
         self.moe_capacity_factor = getattr(config, "moe_capacity_factor", 1.0)
         self.moe_dropless = getattr(config, "moe_dropless", False)  # True => pad to capacity
         self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))
-
+        self.moe_permute_fusion = getattr(config, "moe_permute_fusion", True)
 
         if self.moe_use_optimized:
             if not _MEGATRON_OK:
                 raise RuntimeError("Megatron dispatcher is not available. Please install Megatron.")
             if not torch.cuda.is_available() or not dist.is_available():
                 raise RuntimeError("Megatron dispatcher requires CUDA and dist.")
-            
+
             pgs = make_pg_collection_ep_tp_singleton()
 
             # --- Megatron dispatcher setup (unchanged) ---
@@ -234,13 +238,12 @@ class Lfm2MoeExperts(nn.ModuleList):
             if self.moe_fp8_enable and self.training:
                 self.fp8_padding = te.Fp8Padding(num_gemms=self.num_experts)
                 self.fp8_unpadding = te.Fp8Unpadding(num_gemms=self.num_experts)
-            
+
         if not self.moe_use_optimized:
             config.moe_use_optimized = False
             for _ in range(self.num_experts):
                 self.append(Lfm2MoeMLP(config, intermediate_size=self.ffn_hidden))
-        
-        
+
     # ### DEBUG helpers
     def _rank(self):
         if dist.is_available() and dist.is_initialized():
@@ -268,8 +271,10 @@ class Lfm2MoeExperts(nn.ModuleList):
                     sample = flat[:4].detach().cpu()
                     mn = float(flat.min().detach().cpu()) if flat.numel() else 0.0
                     mx = float(flat.max().detach().cpu()) if flat.numel() else 0.0
-                print(f"{prefix}{msg} | shape={shape} dtype={dtype} device={device} "
-                      f"sample={sample.tolist()} range=[{mn:.4g},{mx:.4g}]")
+                print(
+                    f"{prefix}{msg} | shape={shape} dtype={dtype} device={device} "
+                    f"sample={sample.tolist()} range=[{mn:.4g},{mx:.4g}]"
+                )
             elif isinstance(t, (list, tuple)):
                 print(f"{prefix}{msg} | list_len={len(t)} first5={t[:5]}")
             else:
@@ -278,6 +283,7 @@ class Lfm2MoeExperts(nn.ModuleList):
             print(prefix + f"{msg} | <debug error: {e}>")
 
     from contextlib import contextmanager
+
     @contextmanager
     def _timer(self, tag):
         if not self.moe_debug:
@@ -301,144 +307,108 @@ class Lfm2MoeExperts(nn.ModuleList):
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
-        if not self.moe_use_optimized:
-            self._log("slow path")
-            # (unchanged slow path)
-            final_hidden_states = torch.zeros_like(hidden_states)
-            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-            self._log("expert_hit", expert_hit)
-            self._log("expert_mask", expert_mask)
-            self._log("top_k_weights", top_k_weights)
-            self._log("hidden_states", hidden_states)
-            for expert_idx in expert_hit:
-                idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-                current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
-                current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
-                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-                self._log("current_hidden_states", current_hidden_states)
-                self._log("final_hidden_states", final_hidden_states)
-            return final_hidden_states
+        if self.moe_use_optimized:
+            return self.forward_fast(hidden_states, top_k_index, top_k_weights)
+        self._log("slow path")
+        # (unchanged slow path)
+        final_hidden_states = torch.zeros_like(hidden_states)
+        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        self._log("expert_hit", expert_hit)
+        self._log("expert_mask", expert_mask)
+        self._log("top_k_weights", top_k_weights)
+        self._log("hidden_states", hidden_states)
+        for expert_idx in expert_hit:
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
+            current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            self._log("current_hidden_states", current_hidden_states)
+            self._log("final_hidden_states", final_hidden_states)
+        return final_hidden_states
 
-        # # ---- optimized path ----
-        # tokens = hidden_states.shape[0]
-        # if tokens == 0:
-        #     return hidden_states
-
-        # self._log("forward() start",)
-        # self._log("hidden_states", hidden_states)
-        # self._log("top_k_index", top_k_index)
-        # self._log("top_k_weights", top_k_weights)
-
-        # with self._timer("build routing/probs"):
-        #     routing_map = torch.zeros((tokens, self.num_experts),
-        #                               dtype=torch.uint8, device=hidden_states.device)
-        #     routing_map.scatter_(1, top_k_index, 1)
-        #     routing_map = routing_map.bool()
-        #     probs = torch.zeros((tokens, self.num_experts),
-        #                         dtype=top_k_weights.dtype, device=hidden_states.device)
-        #     probs.scatter_(1, top_k_index, top_k_weights)
-        #     self._log("routing_map (bool) sum", routing_map.sum())
-        #     self._log("probs row-sum ~ top_k?", probs.sum(dim=1))
-
-        # with self._timer("dispatch preprocess"):
-        #     permuted_tokens, permuted_probs = self._dispatcher.dispatch_preprocess(
-        #         hidden_states, routing_map, probs
-        #     )
-        #     self._log("permuted_tokens", permuted_tokens)
-        #     self._log("permuted_probs", permuted_probs)
-
-        # with self._timer("token_dispatch (alltoall)"):
-        #     dispatched_tokens, dispatched_probs = self._dispatcher.token_dispatch(
-        #         permuted_tokens, permuted_probs
-        #     )
-        #     self._log("dispatched_tokens", dispatched_tokens)
-        #     self._log("dispatched_probs", dispatched_probs)
-
-        # with self._timer("dispatch postprocess"):
-        #     expert_tokens, tokens_per_expert, dispatched_probs = self._dispatcher.dispatch_postprocess(dispatched_tokens, dispatched_probs)
-        #     self._log("expert_tokens", expert_tokens)
-        #     self._log("tokens_per_expert", tokens_per_expert)
-        #     self._log("dispatched_probs", dispatched_probs)
-
-        # splits = tokens_per_expert.tolist()
-        # self._log("splits", splits)
-
-        def _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits):
-            if self.moe_fp8_enable and self.training:
-                # Use FP8 autocast just for the expert compute
-                with te.fp8_autocast(enabled=True):
-                    original_splits = splits
-                    tokens_padded, splits = self.fp8_padding(expert_tokens, splits)
-                    dispatched_probs_padded, _ = self.fp8_padding(dispatched_probs.unsqueeze(-1), original_splits)
-                    up = self._fc_up(tokens_padded, m_splits=splits)
-                    gate = self._fc_gate(tokens_padded, m_splits=splits)
-                    hidden = self._act(up) * gate
-                    out_fp8 = self._fc_down(hidden, m_splits=splits)
-                    out_fp8 = out_fp8 * dispatched_probs_padded
-                    out = self.fp8_unpadding(out_fp8, original_splits)
-            else:
-                up = self._fc_up(expert_tokens, m_splits=splits)
-                gate = self._fc_gate(expert_tokens, m_splits=splits)
+    def _experts_core_fp8_aware(self, expert_tokens, dispatched_probs, splits):
+        if self.moe_fp8_enable and self.training:
+            # Use FP8 autocast just for the expert compute
+            with te.fp8_autocast(enabled=True):
+                original_splits = splits
+                tokens_padded, splits = self.fp8_padding(expert_tokens, splits)
+                dispatched_probs_padded, _ = self.fp8_padding(dispatched_probs.unsqueeze(-1), original_splits)
+                up = self._fc_up(tokens_padded, m_splits=splits)
+                gate = self._fc_gate(tokens_padded, m_splits=splits)
                 hidden = self._act(up) * gate
-                out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.unsqueeze(-1)
+                out_fp8 = self._fc_down(hidden, m_splits=splits)
+                out_fp8 = out_fp8 * dispatched_probs_padded
+                out = self.fp8_unpadding(out_fp8, original_splits)
+        else:
+            up = self._fc_up(expert_tokens, m_splits=splits)
+            gate = self._fc_gate(expert_tokens, m_splits=splits)
+            hidden = self._act(up) * gate
+            out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.unsqueeze(-1)
 
-            return out
+        return out
 
-        # if self.training and torch.is_grad_enabled():
-        #     with self._timer("experts (ckpt, fp8-aware)"):
-        #         out_packed = torch.utils.checkpoint.checkpoint(
-        #             _experts_core_fp8_aware, expert_tokens, dispatched_probs, splits, use_reentrant=True
-        #         )
-        # else:
-        #     with self._timer("experts (no-ckpt, fp8-aware)"):
-        #         out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, splits)
-
-        # with self._timer("combine"):
-        #     combined = self._dispatcher.combine_preprocess(out_packed)
-        #     self._log("combine_preprocess(out_packed)", combined)
-        #     combined = self._dispatcher.token_combine(combined)
-        #     self._log("token_combine(combined)", combined)
-        #     out = self._dispatcher.combine_postprocess(combined)
-        #     self._log("combine_postprocess -> out", out)
-
-        # self._log("forward() end")
-        # Replace the block that builds `routing_map`/`probs` and the dispatcher calls.
-        # This sparse local routing keeps grouped GEMM efficiency and avoids [tokens, num_experts] tensors.
+    def forward_fast(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Use Megatron's optimized permute/unpermute but create routing_map on-demand.
+        Memory overhead is temporary and minimal (< 1MB for typical sizes).
+        """
+        from megatron.core.transformer.moe.moe_utils import permute, unpermute
 
         tokens = hidden_states.shape[0]
         top_k = top_k_index.shape[1]
         device = hidden_states.device
 
-        # Flatten token->expert assignments
-        tok_idx = torch.arange(tokens, device=device).repeat_interleave(top_k)
-        exp_idx = top_k_index.reshape(-1)
-        prob_flat = top_k_weights.reshape(-1)
+        # Create routing_map and probs ONLY for the permute operation
+        # These are temporary and will be garbage collected after
+        with torch.no_grad():
+            # Efficient scatter (optimized by PyTorch)
+            routing_map = torch.zeros((tokens, self.num_experts), dtype=torch.bool, device=device)
+            routing_map.scatter_(1, top_k_index, True)
 
-        # Group by expert (stable to preserve order inside each expert)
-        order = torch.argsort(exp_idx, stable=True)
-        tok_idx_sorted = tok_idx.index_select(0, order)
-        probs_sorted = prob_flat.index_select(0, order)
+            probs = torch.zeros((tokens, self.num_experts), dtype=top_k_weights.dtype, device=device)
+            probs.scatter_(1, top_k_index, top_k_weights)
 
-        # Per-expert counts for GroupedLinear
-        tokens_per_expert = torch.bincount(exp_idx, minlength=self.num_experts).tolist()
+        # Get tokens per expert (on GPU, no sync yet)
+        tokens_per_expert = routing_map.sum(dim=0).long()
+        num_out_tokens = tokens * top_k
 
-        # Build packed expert input
-        expert_tokens = hidden_states.index_select(0, tok_idx_sorted).contiguous()
-        dispatched_probs = probs_sorted  # already aligned with expert_tokens
+        # Use Megatron's optimized permute (avoids argsort!)
+        expert_tokens, permuted_probs, reverse_mapping = permute(
+            hidden_states,
+            routing_map,
+            probs=probs,
+            num_out_tokens=num_out_tokens,
+            fused=self.moe_permute_fusion,
+        )
 
-        # Run experts with the existing fp8-aware core
+        # Now routing_map and probs can be GC'd (or explicitly del them)
+        del routing_map, probs
+
+        # Convert to list only when needed (late as possible)
+        tokens_per_expert_list = tokens_per_expert.tolist()
+
+        # Run experts
         if self.training and torch.is_grad_enabled():
             out_packed = torch.utils.checkpoint.checkpoint(
-                _experts_core_fp8_aware, expert_tokens, dispatched_probs, tokens_per_expert, use_reentrant=True
+                self._experts_core_fp8_aware, expert_tokens, permuted_probs, tokens_per_expert_list, use_reentrant=True
             )
         else:
-            out_packed = _experts_core_fp8_aware(expert_tokens, dispatched_probs, tokens_per_expert)
+            out_packed = self._experts_core_fp8_aware(expert_tokens, permuted_probs, tokens_per_expert_list)
 
-        # Combine back to token space (sum contributions from top-k experts)
-        out = torch.zeros_like(hidden_states)
-        out.index_add_(0, tok_idx_sorted, out_packed.to(out.dtype))
+        # Use Megatron's optimized unpermute (faster than index_add_!)
+        out = unpermute(
+            out_packed,
+            reverse_mapping,
+            restore_shape=hidden_states.shape,
+            routing_map=None,  # Can pass None if reverse_mapping is sufficient
+            fused=self.moe_permute_fusion,
+        )
+
         return out
+
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
