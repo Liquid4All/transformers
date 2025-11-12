@@ -51,12 +51,16 @@ else:
 try:
     import transformer_engine.pytorch as te
     from megatron.core.process_groups_config import ModelCommProcessGroups as _ModelCommProcessGroups
-    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher as _Dispatcher
-    from megatron.core.transformer.transformer_config import TransformerConfig as _MCoreCfg
+    from megatron.core.transformer.moe.moe_utils import permute, unpermute
 
     _MEGATRON_OK = True
 except Exception:
     _MEGATRON_OK = False
+
+from transformer_engine.common import recipe
+
+
+blockwise_recipe = recipe.Float8BlockScaling(fp8_format=recipe.Format.HYBRID)
 
 
 def make_pg_collection_ep_tp_singleton():
@@ -170,7 +174,7 @@ class Lfm2MoeMLP(nn.Module):
             self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        with te.fp8_autocast(enabled=self.moe_fp8_enable and self.training):
+        with te.autocast(enabled=self.moe_fp8_enable and self.training, recipe=blockwise_recipe):
             return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
@@ -197,32 +201,8 @@ class Lfm2MoeExperts(nn.ModuleList):
 
         if self.moe_use_optimized:
             if not _MEGATRON_OK:
-                raise RuntimeError("Megatron dispatcher is not available. Please install Megatron.")
-            if not torch.cuda.is_available() or not dist.is_available():
-                raise RuntimeError("Megatron dispatcher requires CUDA and dist.")
+                raise RuntimeError("Megatron is not available. Please install Megatron.")
 
-            pgs = make_pg_collection_ep_tp_singleton()
-
-            # --- Megatron dispatcher setup (unchanged) ---
-            self._mcore_cfg = _MCoreCfg(
-                hidden_size=self.hidden_size,
-                num_attention_heads=config.num_attention_heads,
-                num_layers=max(config.num_hidden_layers, 1),
-                num_moe_experts=self.num_experts,
-                moe_ffn_hidden_size=self.ffn_hidden,
-                ffn_hidden_size=self.ffn_hidden,
-                add_bias_linear=False,
-                moe_router_topk=self.moe_top_k,
-                moe_expert_capacity_factor=self.moe_capacity_factor,
-                moe_pad_expert_input_to_capacity=self.moe_dropless,
-                moe_token_dispatcher_type="alltoall",
-            )
-            self._dispatcher = _Dispatcher(
-                num_local_experts=self.num_experts,
-                local_expert_indices=list(range(self.num_experts)),
-                config=self._mcore_cfg,
-                model_comm_pgs=pgs,
-            )
             # --- Grouped MLP (unchanged) ---
             self._fc_up = te.GroupedLinear(
                 num_gemms=self.num_experts, in_features=self.hidden_size, out_features=self.ffn_hidden, bias=False
@@ -309,28 +289,22 @@ class Lfm2MoeExperts(nn.ModuleList):
     ) -> torch.Tensor:
         if self.moe_use_optimized:
             return self.forward_fast(hidden_states, top_k_index, top_k_weights)
-        self._log("slow path")
+
         # (unchanged slow path)
         final_hidden_states = torch.zeros_like(hidden_states)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        self._log("expert_hit", expert_hit)
-        self._log("expert_mask", expert_mask)
-        self._log("top_k_weights", top_k_weights)
-        self._log("hidden_states", hidden_states)
         for expert_idx in expert_hit:
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
             current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
             current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-            self._log("current_hidden_states", current_hidden_states)
-            self._log("final_hidden_states", final_hidden_states)
         return final_hidden_states
 
     def _experts_core_fp8_aware(self, expert_tokens, dispatched_probs, splits):
         if self.moe_fp8_enable and self.training:
             # Use FP8 autocast just for the expert compute
-            with te.fp8_autocast(enabled=True):
+            with te.autocast(enabled=True, recipe=blockwise_recipe):
                 original_splits = splits
                 tokens_padded, splits = self.fp8_padding(expert_tokens, splits)
                 dispatched_probs_padded, _ = self.fp8_padding(dispatched_probs.unsqueeze(-1), original_splits)
@@ -355,27 +329,21 @@ class Lfm2MoeExperts(nn.ModuleList):
         Use Megatron's optimized permute/unpermute but create routing_map on-demand.
         Memory overhead is temporary and minimal (< 1MB for typical sizes).
         """
-        from megatron.core.transformer.moe.moe_utils import permute, unpermute
 
         tokens = hidden_states.shape[0]
         top_k = top_k_index.shape[1]
         device = hidden_states.device
 
-        # Create routing_map and probs ONLY for the permute operation
-        # These are temporary and will be garbage collected after
         with torch.no_grad():
-            # Efficient scatter (optimized by PyTorch)
             routing_map = torch.zeros((tokens, self.num_experts), dtype=torch.bool, device=device)
             routing_map.scatter_(1, top_k_index, True)
 
             probs = torch.zeros((tokens, self.num_experts), dtype=top_k_weights.dtype, device=device)
             probs.scatter_(1, top_k_index, top_k_weights)
 
-        # Get tokens per expert (on GPU, no sync yet)
         tokens_per_expert = routing_map.sum(dim=0).long()
         num_out_tokens = tokens * top_k
 
-        # Use Megatron's optimized permute (avoids argsort!)
         expert_tokens, permuted_probs, reverse_mapping = permute(
             hidden_states,
             routing_map,
@@ -384,13 +352,10 @@ class Lfm2MoeExperts(nn.ModuleList):
             fused=self.moe_permute_fusion,
         )
 
-        # Now routing_map and probs can be GC'd (or explicitly del them)
         del routing_map, probs
 
-        # Convert to list only when needed (late as possible)
         tokens_per_expert_list = tokens_per_expert.tolist()
 
-        # Run experts
         if self.training and torch.is_grad_enabled():
             out_packed = torch.utils.checkpoint.checkpoint(
                 self._experts_core_fp8_aware, expert_tokens, permuted_probs, tokens_per_expert_list, use_reentrant=True
@@ -398,12 +363,11 @@ class Lfm2MoeExperts(nn.ModuleList):
         else:
             out_packed = self._experts_core_fp8_aware(expert_tokens, permuted_probs, tokens_per_expert_list)
 
-        # Use Megatron's optimized unpermute (faster than index_add_!)
         out = unpermute(
             out_packed,
             reverse_mapping,
             restore_shape=hidden_states.shape,
-            routing_map=None,  # Can pass None if reverse_mapping is sufficient
+            routing_map=None,
             fused=self.moe_permute_fusion,
         )
 
