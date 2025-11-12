@@ -291,12 +291,14 @@ class Lfm2MoeExperts(nn.ModuleList):
             return self.forward_fast(hidden_states, top_k_index, top_k_weights)
 
         # (unchanged slow path)
+        self._log("Entering slow path")
         final_hidden_states = torch.zeros_like(hidden_states)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hit:
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
             current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
+            self._log(f"Expert {expert_idx} hit {current_state.shape[0]} tokens")
             current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         return final_hidden_states
@@ -341,7 +343,7 @@ class Lfm2MoeExperts(nn.ModuleList):
             probs = torch.zeros((tokens, self.num_experts), dtype=top_k_weights.dtype, device=device)
             probs.scatter_(1, top_k_index, top_k_weights)
 
-        tokens_per_expert = routing_map.sum(dim=0).long()
+        tokens_per_expert = routing_map.sum(dim=0).long().cpu()
         num_out_tokens = tokens * top_k
 
         expert_tokens, permuted_probs, reverse_mapping = permute(
@@ -367,7 +369,6 @@ class Lfm2MoeExperts(nn.ModuleList):
             out_packed,
             reverse_mapping,
             restore_shape=hidden_states.shape,
-            routing_map=None,
             fused=self.moe_permute_fusion,
         )
 
