@@ -189,21 +189,18 @@ class Lfm2MoeExperts(nn.ModuleList):
         self.hidden_size = config.hidden_size
         self.ffn_hidden = config.moe_intermediate_size
 
-        # ### DEBUG: toggle (config or env)
-        self.moe_debug = bool(getattr(config, "moe_debug", False) or int(os.environ.get("LFM2_MOE_DEBUG", "0")))
+        self.debug = bool(getattr(config, "debug", False) or int(os.environ.get("LFM2_MOE_DEBUG", "0")))
 
-        self.moe_use_optimized = getattr(config, "moe_use_optimized", False)
-        self.moe_top_k = getattr(config, "num_experts_per_tok", 2)
-        self.moe_capacity_factor = getattr(config, "moe_capacity_factor", 1.0)
-        self.moe_dropless = getattr(config, "moe_dropless", False)  # True => pad to capacity
-        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))
-        self.moe_permute_fusion = getattr(config, "moe_permute_fusion", True)
+        self.use_optimized = getattr(config, "use_optimized", False)
+        self.capacity_factor = getattr(config, "capacity_factor", 1.0)
+        self.dropless = getattr(config, "dropless", False)  # True => pad to capacity
+        self.fp8_enable = bool(getattr(config, "fp8_enable", True))
+        self.permute_fusion = getattr(config, "permute_fusion", True)
 
-        if self.moe_use_optimized:
+        if self.use_optimized:
             if not _MEGATRON_OK:
                 raise RuntimeError("Megatron is not available. Please install Megatron.")
 
-            # --- Grouped MLP (unchanged) ---
             self._fc_up = te.GroupedLinear(
                 num_gemms=self.num_experts, in_features=self.hidden_size, out_features=self.ffn_hidden, bias=False
             )
@@ -215,12 +212,12 @@ class Lfm2MoeExperts(nn.ModuleList):
             )
             self._act = F.silu
 
-            if self.moe_fp8_enable and self.training:
+            if self.fp8_enable and self.training:
                 self.fp8_padding = te.Fp8Padding(num_gemms=self.num_experts)
                 self.fp8_unpadding = te.Fp8Unpadding(num_gemms=self.num_experts)
 
-        if not self.moe_use_optimized:
-            config.moe_use_optimized = False
+        if not self.use_optimized:
+            config.use_optimized = False
             for _ in range(self.num_experts):
                 self.append(Lfm2MoeMLP(config, intermediate_size=self.ffn_hidden))
 
@@ -234,7 +231,7 @@ class Lfm2MoeExperts(nn.ModuleList):
         return 0
 
     def _log(self, msg, t=None):
-        if not self.moe_debug:
+        if not self.debug:
             return
         prefix = f"[MOE|opt|rank{self._rank()}] "
         if t is None:
@@ -266,7 +263,7 @@ class Lfm2MoeExperts(nn.ModuleList):
 
     @contextmanager
     def _timer(self, tag):
-        if not self.moe_debug:
+        if not self.debug:
             yield
             return
         torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -278,16 +275,10 @@ class Lfm2MoeExperts(nn.ModuleList):
             dt = (time.time() - t0) * 1000.0
             self._log(f"{tag} took {dt:.2f} ms")
 
-    @torch.no_grad()
-    def _capacity(self, tokens: int) -> int:
-        per_exp = (tokens * self.moe_top_k + self.num_experts - 1) // self.num_experts
-        cap = int(self.moe_capacity_factor * per_exp)
-        return (cap + 7) // 8 * 8  # align a bit
-
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
-        if self.moe_use_optimized:
+        if self.use_optimized:
             return self.forward_fast(hidden_states, top_k_index, top_k_weights)
 
         # (unchanged slow path)
@@ -304,7 +295,7 @@ class Lfm2MoeExperts(nn.ModuleList):
         return final_hidden_states
 
     def _experts_core_fp8_aware(self, expert_tokens, dispatched_probs, splits):
-        if self.moe_fp8_enable and self.training:
+        if self.fp8_enable and self.training:
             # Use FP8 autocast just for the expert compute
             with te.autocast(enabled=True, recipe=blockwise_recipe):
                 original_splits = splits
@@ -357,6 +348,7 @@ class Lfm2MoeExperts(nn.ModuleList):
         del routing_map, probs
 
         tokens_per_expert_list = tokens_per_expert.tolist()
+        self._log(f"tokens_per_expert_list: {tokens_per_expert_list}")
 
         if self.training and torch.is_grad_enabled():
             out_packed = torch.utils.checkpoint.checkpoint(
