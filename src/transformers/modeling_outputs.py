@@ -397,6 +397,8 @@ class MoeModelOutputWithPast(ModelOutput):
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
     router_logits: Optional[tuple[torch.FloatTensor]] = None
+    moe_metrics: Optional[dict[str, torch.FloatTensor]] = None
+    per_layer_tokens_per_expert: Optional[tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -689,6 +691,8 @@ class CausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[Cache] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    moe_metrics: Optional[dict[str, torch.FloatTensor]] = None
+    per_layer_tokens_per_expert: Optional[tuple[torch.FloatTensor]] = None
 
 
 @dataclass

@@ -243,11 +243,11 @@ def main():
     local_rank = init_dist()
 
     config = AutoConfig.from_pretrained("LiquidAI/LFM2-8B-A1B")
-    config.moe_use_optimized = True
-    config.moe_dropless = True
-    config.moe_capacity_factor = 1.25
-    config.moe_debug = DEBUG
-    config.moe_fp8_enable = False
+    config.use_optimized = True
+    config.dropless = True
+    config.capacity_factor = 1.25
+    config.debug = DEBUG
+    config.fp8_enable = False
 
     model = Lfm2MoeForCausalLM.from_pretrained(
         "/lambdafs/anna/lfm2-8b-a1b-te-grouped", torch_dtype=torch.bfloat16, device_map=local_rank, config=config
@@ -255,7 +255,7 @@ def main():
     model.eval()  # ADD THIS
 
     config_ref = AutoConfig.from_pretrained("LiquidAI/LFM2-8B-A1B")
-    config_ref.moe_debug = DEBUG
+    config_ref.debug = DEBUG
 
     ref_model = Lfm2MoeForCausalLM.from_pretrained(
         "LiquidAI/LFM2-8B-A1B", torch_dtype=torch.bfloat16, device_map=local_rank, config=config_ref

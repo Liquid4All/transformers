@@ -47,15 +47,15 @@ if is_causal_conv1d_available():
 else:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
-# optional deps only needed when optimized=True
+# optional deps
 try:
     import transformer_engine.pytorch as te
-    from megatron.core.process_groups_config import ModelCommProcessGroups as _ModelCommProcessGroups
     from megatron.core.transformer.moe.moe_utils import permute, unpermute
 
     _MEGATRON_OK = True
 except Exception:
     _MEGATRON_OK = False
+
 
 from transformer_engine.common import recipe
 
@@ -63,12 +63,81 @@ from transformer_engine.common import recipe
 blockwise_recipe = recipe.Float8BlockScaling(fp8_format=recipe.Format.HYBRID)
 
 
-def make_pg_collection_ep_tp_singleton():
-    rank = dist.get_rank()
-    ep = dist.new_group(ranks=[rank])
-    tp_ep = dist.new_group(ranks=[rank])
-    tp = dist.new_group(ranks=[rank])
-    return _ModelCommProcessGroups(ep=ep, tp_ep=tp_ep, expt_tp=tp)
+# >>> MOE METRICS: helper
+def _compute_moe_load_metrics(all_expert_loads: list[torch.Tensor]):
+    """
+    Inputs: list of [N] load vectors (float/long), one per MoE layer.
+    Returns: (metrics_dict, loads_stacked [L,N])
+    Note: Returns per-device stats only. Caller should reduce across devices if needed.
+    """
+    assert len(all_expert_loads) > 0
+    device = all_expert_loads[0].device
+    dtype = torch.float32
+
+    loads = torch.stack([v.to(dtype) for v in all_expert_loads], dim=0)  # [L,N]
+    # Removed: world_reduce logic and dist.all_reduce()
+
+    L, N = loads.shape
+    totals = loads.sum(dim=1)  # [L]
+    num_routed_tokens = totals.mean()  # scalar (float tensor)
+    ideal = (num_routed_tokens / N).clamp_min(1.0)  # scalar
+    p = loads / totals.clamp_min(1.0).unsqueeze(1)  # [L,N]
+
+    # Hypothetical overflow if capacity = ideal
+    overflow = (loads - ideal).clamp_min(0).sum(dim=1) / num_routed_tokens  # [L]
+    hypothetical_overflow_percentage_raw = overflow.mean()
+
+    # Max violation (hottest expert)
+    max_max_violation_raw = (loads.max(dim=1).values / ideal - 1.0).max()
+
+    # Router KL normalized
+    ent = -(p * p.clamp_min(1e-12).log()).sum(dim=1).mean()
+    logN = torch.log(torch.tensor(float(N), device=device, dtype=dtype))
+    router_kl_normalized = (logN - ent) / logN
+
+    # 95th percentile of positive violations
+    pos = (loads / ideal - 1.0).clamp_min(0.0)
+    violation_p95_mean_raw = torch.quantile(pos, 0.95, dim=1).mean()
+
+    # Bottom-5% experts mean share scaled (uniform=1.0)
+    k = max(1, int(0.05 * N))
+    bottom_vals, _ = torch.topk(p, k, dim=1, largest=False)
+    bottom5_share_mean_scaled = bottom_vals.mean(dim=1).mean() * N
+
+    # Zero & hot fractions over all L×N experts
+    hot_mult = 1.5
+    expert_zero_frac_all = (loads == 0).float().mean()
+    expert_hot_frac_all = (loads > (hot_mult * ideal)).float().mean()
+
+    # Std of shares normalized by theoretical cap
+    std_max = (N - 1) ** 0.5 / N
+    expert_load_pct_std_all = p.std(unbiased=False) / std_max
+
+    # Global Gini over all L×N (normalized)
+    x = loads.reshape(-1)
+    if x.sum() > 0:
+        xs = torch.sort(x).values
+        M = xs.numel()
+        gini = (2 * (torch.arange(1, M + 1, device=device, dtype=dtype) * xs).sum() / (M * xs.sum())) - (M + 1) / M
+        expert_load_gini_all = gini / (1.0 - 1.0 / M)
+    else:
+        expert_load_gini_all = torch.zeros((), device=device, dtype=dtype)
+
+    metrics = {
+        "router_kl_normalized": router_kl_normalized,
+        "violation_p95_mean_raw": violation_p95_mean_raw,
+        "max_max_violation_raw": max_max_violation_raw,
+        "hypothetical_overflow_percentage_raw": hypothetical_overflow_percentage_raw,
+        "expert_zero_frac_all": expert_zero_frac_all,
+        "expert_hot_frac_all": expert_hot_frac_all,
+        "expert_load_pct_std_all": expert_load_pct_std_all,
+        "expert_load_gini_all": expert_load_gini_all,
+        "bottom5_share_mean_scaled": bottom5_share_mean_scaled,
+    }
+    return metrics, loads  # loads = per_layer_tokens_per_expert [L,N]
+
+
+# <<< MOE METRICS
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -132,10 +201,7 @@ class Lfm2MoeRotaryEmbedding(nn.Module):
         """
         base = config.rope_parameters["rope_theta"]
         dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-
-        attention_factor = 1.0  # Unused in this type of RoPE
-
-        # Compute the inverse frequencies
+        attention_factor = 1.0
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
         )
@@ -162,7 +228,7 @@ class Lfm2MoeMLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", True))
+        self.moe_fp8_enable = bool(getattr(config, "moe_fp8_enable", False))
 
         if self.moe_fp8_enable and self.training:
             self.w1 = te.Linear(in_features=self.hidden_size, out_features=self.intermediate_size, bias=False)
@@ -194,8 +260,8 @@ class Lfm2MoeExperts(nn.ModuleList):
         self.use_optimized = getattr(config, "use_optimized", False)
         self.capacity_factor = getattr(config, "capacity_factor", 1.0)
         self.dropless = getattr(config, "dropless", False)  # True => pad to capacity
-        self.fp8_enable = bool(getattr(config, "fp8_enable", True))
-        self.permute_fusion = getattr(config, "permute_fusion", True)
+        self.fp8_enable = bool(getattr(config, "fp8_enable", False))
+        self.permute_fusion = getattr(config, "permute_fusion", False)
 
         if self.use_optimized:
             if not _MEGATRON_OK:
@@ -277,11 +343,19 @@ class Lfm2MoeExperts(nn.ModuleList):
 
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_optimized:
             return self.forward_fast(hidden_states, top_k_index, top_k_weights)
 
         # (unchanged slow path)
+        with torch.no_grad():
+            N = self.experts.num_experts
+            tokens_per_expert = torch.bincount(top_k_index.reshape(-1), minlength=N).to(
+                device=hidden_states.device, dtype=torch.float32
+            )
+
+        self._log(f"tokens_per_expert: {tokens_per_expert}")
+
         self._log("Entering slow path")
         final_hidden_states = torch.zeros_like(hidden_states)
         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
@@ -292,7 +366,7 @@ class Lfm2MoeExperts(nn.ModuleList):
             self._log(f"Expert {expert_idx} hit {current_state.shape[0]} tokens")
             current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        return final_hidden_states
+        return final_hidden_states, tokens_per_expert
 
     def _experts_core_fp8_aware(self, expert_tokens, dispatched_probs, splits):
         if self.fp8_enable and self.training:
@@ -312,12 +386,11 @@ class Lfm2MoeExperts(nn.ModuleList):
             gate = self._fc_gate(expert_tokens, m_splits=splits)
             hidden = self._act(up) * gate
             out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.unsqueeze(-1)
-
         return out
 
     def forward_fast(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Use Megatron's optimized permute/unpermute but create routing_map on-demand.
         Memory overhead is temporary and minimal (< 1MB for typical sizes).
@@ -330,7 +403,6 @@ class Lfm2MoeExperts(nn.ModuleList):
         with torch.no_grad():
             routing_map = torch.zeros((tokens, self.num_experts), dtype=torch.bool, device=device)
             routing_map.scatter_(1, top_k_index, True)
-
             probs = torch.zeros((tokens, self.num_experts), dtype=top_k_weights.dtype, device=device)
             probs.scatter_(1, top_k_index, top_k_weights)
 
@@ -338,33 +410,29 @@ class Lfm2MoeExperts(nn.ModuleList):
         num_out_tokens = tokens * top_k
 
         expert_tokens, permuted_probs, reverse_mapping = permute(
-            hidden_states,
-            routing_map,
-            probs=probs,
-            num_out_tokens=num_out_tokens,
-            fused=self.moe_permute_fusion,
+            hidden_states, routing_map, probs=probs, num_out_tokens=num_out_tokens, fused=self.permute_fusion
         )
 
         del routing_map, probs
+        splits = tokens_per_expert.tolist()
 
         tokens_per_expert_list = tokens_per_expert.tolist()
         self._log(f"tokens_per_expert_list: {tokens_per_expert_list}")
 
         if self.training and torch.is_grad_enabled():
             out_packed = torch.utils.checkpoint.checkpoint(
-                self._experts_core_fp8_aware, expert_tokens, permuted_probs, tokens_per_expert_list, use_reentrant=True
+                self._experts_core_fp8_aware, expert_tokens, permuted_probs, splits, use_reentrant=True
             )
         else:
-            out_packed = self._experts_core_fp8_aware(expert_tokens, permuted_probs, tokens_per_expert_list)
+            out_packed = self._experts_core_fp8_aware(expert_tokens, permuted_probs, splits)
 
         out = unpermute(
             out_packed,
             reverse_mapping,
             restore_shape=hidden_states.shape,
-            fused=self.moe_permute_fusion,
+            fused=self.permute_fusion,
         )
-
-        return out
+        return out, tokens_per_expert
 
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
@@ -394,13 +462,18 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         routing_weights = routing_weights * self.routed_scaling_factor
         return selected_experts, routing_weights
 
+    # >>> MOE METRICS: return tokens_per_expert from MoE FFN
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states_reshaped)
         selected_experts, routing_weights = self.route_tokens_to_experts(router_logits)
-        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states, tokens_per_expert = self.experts(
+            hidden_states_reshaped, selected_experts, routing_weights
+        )
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), tokens_per_expert
+
+    # <<< MOE METRICS
 
 
 class Lfm2MoeHybridConvCache:
@@ -809,6 +882,7 @@ class Lfm2MoeDecoderLayer(GradientCheckpointingLayer):
         self.operator_norm = Lfm2MoeRMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = Lfm2MoeRMSNorm(config.hidden_size, eps=config.norm_eps)
 
+    # >>> MOE METRICS: return (hidden, tokens_per_expert_or_none)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -818,8 +892,11 @@ class Lfm2MoeDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Lfm2MoeHybridConvCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
         residual = hidden_states
+        tpe = None
+
+        # attention/conv block
         if self.is_attention_layer:
             hidden_states, _ = self.self_attn(
                 hidden_states=self.operator_norm(hidden_states),
@@ -837,10 +914,19 @@ class Lfm2MoeDecoderLayer(GradientCheckpointingLayer):
                 cache_position=cache_position,
                 attention_mask=attention_mask,
             )
-        hidden_states = hidden_states + residual
-        hidden_states = hidden_states + self.feed_forward(self.ffn_norm(hidden_states))
 
-        return hidden_states
+        hidden_states = hidden_states + residual  # first residual
+
+        # feed-forward (MLP or MoE)
+        if isinstance(self.feed_forward, Lfm2MoeMLP):
+            hidden_states = hidden_states + self.feed_forward(self.ffn_norm(hidden_states))
+            return hidden_states, None
+        else:
+            ffn_out, tpe = self.feed_forward(self.ffn_norm(hidden_states))  # MoE path
+            hidden_states = hidden_states + ffn_out
+            return hidden_states, tpe
+
+    # <<< MOE METRICS
 
 
 @auto_docstring
@@ -890,6 +976,7 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        return_moe_metrics: Optional[bool] = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -925,9 +1012,10 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.pos_emb(hidden_states, position_ids=position_ids)
 
-        # decoder layers
+        # >>> MOE METRICS: collect per-layer tokens_per_expert
+        all_expert_loads = []
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+            out = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
@@ -936,12 +1024,29 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            if isinstance(out, tuple) and len(out) == 2:
+                hidden_states, tpe = out
+                if tpe is not None:
+                    all_expert_loads.append(tpe)
+            else:
+                hidden_states = out
+        # <<< MOE METRICS
 
         hidden_states = self.embedding_norm(hidden_states)
+
+        # >>> MOE METRICS: compute & attach
+        moe_metrics = None
+        per_layer_tokens = None
+        if return_moe_metrics and len(all_expert_loads) > 0:
+            with torch.no_grad():
+                moe_metrics, per_layer_tokens = _compute_moe_load_metrics(all_expert_loads)
+        # <<< MOE METRICS
 
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            moe_metrics=moe_metrics,  # NEW
+            per_layer_tokens_per_expert=per_layer_tokens,  # NEW [L, N]
         )
 
 
@@ -1012,12 +1117,15 @@ class Lfm2MoeForCausalLM(Lfm2MoePreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
+        # >>> pass-through extra fields
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            moe_metrics=getattr(outputs, "moe_metrics", None),  # NEW
+            per_layer_tokens_per_expert=getattr(outputs, "per_layer_tokens_per_expert", None),  # NEW
         )
 
 
