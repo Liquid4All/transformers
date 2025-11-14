@@ -240,14 +240,15 @@ def init_dist():
 
 def main():
     DEBUG = False
+    USE_BIAS = True
     local_rank = init_dist()
 
     config = AutoConfig.from_pretrained("LiquidAI/LFM2-8B-A1B")
     config.use_optimized = True
-    config.dropless = True
-    config.capacity_factor = 1.25
     config.debug = DEBUG
     config.fp8_enable = False
+    config.use_expert_bias = USE_BIAS
+    config.permute_fusion = False
 
     model = Lfm2MoeForCausalLM.from_pretrained(
         "/lambdafs/anna/lfm2-8b-a1b-te-grouped", torch_dtype=torch.bfloat16, device_map=local_rank, config=config
@@ -256,6 +257,7 @@ def main():
 
     config_ref = AutoConfig.from_pretrained("LiquidAI/LFM2-8B-A1B")
     config_ref.debug = DEBUG
+    config_ref.use_expert_bias = USE_BIAS
 
     ref_model = Lfm2MoeForCausalLM.from_pretrained(
         "LiquidAI/LFM2-8B-A1B", torch_dtype=torch.bfloat16, device_map=local_rank, config=config_ref
@@ -263,6 +265,31 @@ def main():
     ref_model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained("LiquidAI/LFM2-8B-A1B")
+
+        # Debug: Check if expert_bias matches
+    if USE_BIAS:
+        print("\n" + "=" * 60)
+        print("DEBUGGING EXPERT BIAS")
+        print("=" * 60)
+        for L in range(model.config.num_hidden_layers):
+            layer_opt = model.model.layers[L]
+            layer_ref = ref_model.model.layers[L]
+            
+            if hasattr(layer_opt.feed_forward, 'expert_bias'):
+                bias_opt = layer_opt.feed_forward.expert_bias
+                bias_ref = layer_ref.feed_forward.expert_bias
+                
+                if not torch.allclose(bias_opt.float(), bias_ref.float(), atol=1e-6):
+                    print(f"  ⚠️  MISMATCH DETECTED!")
+                    print(f"  Max diff: {(bias_opt.float() - bias_ref.float()).abs().max().item()}")
+
+                    print(f"\nLayer {L}:")
+                    print(f"  Opt dtype: {bias_opt.dtype}, Ref dtype: {bias_ref.dtype}")
+                    print(f"  Opt values: {bias_opt[:8]}")  # First 8 experts
+                    print(f"  Ref values: {bias_ref[:8]}")
+                    print(f"  Match: {torch.allclose(bias_opt.float(), bias_ref.float(), atol=1e-6)}")
+                else:
+                    print(f"  Expert bias matches!")
 
     # *** TEST LOGITS FIRST (correctness check) ***
     print("\n" + "=" * 60)
@@ -274,7 +301,7 @@ def main():
     print("\n" + "=" * 60)
     print("STEP 2: Benchmarking generation speed")
     print("=" * 60)
-    prompt = "What is the capital of Poland?"
+    prompt = "What is the capital of Poland? Tell me a joke."
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
@@ -282,14 +309,14 @@ def main():
         tokenize=True,
     ).to(local_rank)
 
-    attempts = 10
+    attempts = 1
 
     print("\nBenchmarking optimized model...")
     start_time = time.time()
     for _ in range(attempts):
         output_opt = model.generate(
             input_ids,
-            do_sample=False,  # Fixed indentation
+            do_sample=False,
             max_new_tokens=256,
         )
     end_time = time.time()

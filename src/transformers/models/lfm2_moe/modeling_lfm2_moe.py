@@ -262,8 +262,6 @@ class Lfm2MoeExperts(nn.ModuleList):
         self.debug = bool(getattr(config, "debug", False) or int(os.environ.get("LFM2_MOE_DEBUG", "0")))
 
         self.use_optimized = getattr(config, "use_optimized", False)
-        self.capacity_factor = getattr(config, "capacity_factor", 1.0)
-        self.dropless = getattr(config, "dropless", False)  # True => pad to capacity
         self.fp8_enable = bool(getattr(config, "fp8_enable", False))
         self.permute_fusion = getattr(config, "permute_fusion", False)
 
