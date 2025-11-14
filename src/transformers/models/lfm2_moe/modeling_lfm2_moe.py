@@ -40,27 +40,28 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import check_model_inputs
 from ...utils.import_utils import is_causal_conv1d_available
 from .configuration_lfm2_moe import Lfm2MoeConfig
-
+from transformers.utils import logging
 
 if is_causal_conv1d_available():
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 else:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
-# optional deps
+logger = logging.get_logger(__name__)
+
 try:
     import transformer_engine.pytorch as te
     from megatron.core.transformer.moe.moe_utils import permute, unpermute
+    from transformer_engine.common import recipe
 
-    _MEGATRON_OK = True
+    blockwise_recipe = recipe.Float8BlockScaling(fp8_format=recipe.Format.HYBRID)
+
+    OPTIMIZED = True
 except Exception:
-    _MEGATRON_OK = False
+    logger.warning("Megatron or Transformer Engine is not available. Please install Megatron and Transformer Engine.")
+    OPTIMIZED = False
 
-
-from transformer_engine.common import recipe
-
-
-blockwise_recipe = recipe.Float8BlockScaling(fp8_format=recipe.Format.HYBRID)
+    blockwise_recipe = None
 
 
 # >>> MOE METRICS: helper
@@ -240,7 +241,10 @@ class Lfm2MoeMLP(nn.Module):
             self.w2 = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        with te.autocast(enabled=self.moe_fp8_enable and self.training, recipe=blockwise_recipe):
+        if OPTIMIZED:
+            with te.autocast(enabled=self.moe_fp8_enable and self.training, recipe=blockwise_recipe):
+                return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        else:
             return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
@@ -264,7 +268,7 @@ class Lfm2MoeExperts(nn.ModuleList):
         self.permute_fusion = getattr(config, "permute_fusion", False)
 
         if self.use_optimized:
-            if not _MEGATRON_OK:
+            if not OPTIMIZED:
                 raise RuntimeError("Megatron is not available. Please install Megatron.")
 
             self._fc_up = te.GroupedLinear(
@@ -349,7 +353,7 @@ class Lfm2MoeExperts(nn.ModuleList):
 
         # (unchanged slow path)
         with torch.no_grad():
-            N = self.experts.num_experts
+            N = self.num_experts
             tokens_per_expert = torch.bincount(top_k_index.reshape(-1), minlength=N).to(
                 device=hidden_states.device, dtype=torch.float32
             )
