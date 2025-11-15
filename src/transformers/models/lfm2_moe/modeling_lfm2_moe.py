@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from ...activations import ACT2FN
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub
@@ -250,7 +251,7 @@ class Lfm2MoeMLP(nn.Module):
 
 class Lfm2MoeExperts(nn.ModuleList):
     """
-    ModuleList of experts (default path), OR a grouped MLP fast path (optimized=True).
+    ModuleList of experts.
     """
 
     def __init__(self, config):
@@ -360,81 +361,25 @@ class Lfm2MoeExperts(nn.ModuleList):
 
         self._log("Entering slow path")
         final_hidden_states = torch.zeros_like(hidden_states)
-        expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_states.shape[-1])
-            self._log(f"Expert {expert_idx} hit {current_state.shape[0]} tokens")
-            current_hidden_states = self[expert_idx](current_state) * top_k_weights[top_x, idx, None]
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-        return final_hidden_states, tokens_per_expert
-
-    def _experts_core_fp8_aware(self, expert_tokens, dispatched_probs, splits):
-        if self.fp8_enable and self.training:
-            # Use FP8 autocast just for the expert compute
-            with te.autocast(enabled=True, recipe=blockwise_recipe):
-                original_splits = splits
-                tokens_padded, splits = self.fp8_padding(expert_tokens, splits)
-                dispatched_probs_padded, _ = self.fp8_padding(dispatched_probs.unsqueeze(-1), original_splits)
-                up = self._fc_up(tokens_padded, m_splits=splits)
-                gate = self._fc_gate(tokens_padded, m_splits=splits)
-                hidden = self._act(up) * gate
-                out_fp8 = self._fc_down(hidden, m_splits=splits)
-                out_fp8 = out_fp8 * dispatched_probs_padded
-                out = self.fp8_unpadding(out_fp8, original_splits)
-        else:
-            up = self._fc_up(expert_tokens, m_splits=splits)
-            gate = self._fc_gate(expert_tokens, m_splits=splits)
-            hidden = self._act(up) * gate
-            out = self._fc_down(hidden, m_splits=splits) * dispatched_probs.unsqueeze(-1)
-        return out
-
-    def forward_fast(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Use Megatron's optimized permute/unpermute but create routing_map on-demand.
-        Memory overhead is temporary and minimal (< 1MB for typical sizes).
-        """
-
-        tokens = hidden_states.shape[0]
-        top_k = top_k_index.shape[1]
-        device = hidden_states.device
-
+        num_experts = top_k_weights.shape[1]
         with torch.no_grad():
-            routing_map = torch.zeros((tokens, self.num_experts), dtype=torch.bool, device=device)
-            routing_map.scatter_(1, top_k_index, True)
-            probs = torch.zeros((tokens, self.num_experts), dtype=top_k_weights.dtype, device=device)
-            probs.scatter_(1, top_k_index, top_k_weights)
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=num_experts + 1)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-        tokens_per_expert = routing_map.sum(dim=0).long().cpu()
-        num_out_tokens = tokens * top_k
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == num_experts:
+                continue
+            _, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, expert_idx, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
-        expert_tokens, permuted_probs, reverse_mapping = permute(
-            hidden_states, routing_map, probs=probs, num_out_tokens=num_out_tokens, fused=self.permute_fusion
-        )
-
-        del routing_map, probs
-        splits = tokens_per_expert.tolist()
-
-        tokens_per_expert_list = tokens_per_expert.tolist()
-        self._log(f"tokens_per_expert_list: {tokens_per_expert_list}")
-
-        if self.training and torch.is_grad_enabled():
-            out_packed = torch.utils.checkpoint.checkpoint(
-                self._experts_core_fp8_aware, expert_tokens, permuted_probs, splits, use_reentrant=True
-            )
-        else:
-            out_packed = self._experts_core_fp8_aware(expert_tokens, permuted_probs, splits)
-
-        out = unpermute(
-            out_packed,
-            reverse_mapping,
-            restore_shape=hidden_states.shape,
-            fused=self.permute_fusion,
-        )
-        return out, tokens_per_expert
+        return final_hidden_states
 
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
@@ -749,6 +694,7 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     """
     Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
     """
+    # NOTE: attention mask is a 2D boolean tensor
     if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
         dtype = hidden_states.dtype
         hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
@@ -1010,6 +956,8 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
+        # Skip masking for decoding stage. We check shape here to be compile-friendly
+        linear_attention = attention_mask if inputs_embeds.shape[1] != 1 else None
 
         hidden_states = inputs_embeds
         position_embeddings = self.pos_emb(hidden_states, position_ids=position_ids)
@@ -1017,9 +965,10 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
         # >>> MOE METRICS: collect per-layer tokens_per_expert
         all_expert_loads = []
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            layer_mask = causal_mask if decoder_layer.is_attention_layer else linear_attention
             out = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=layer_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
@@ -1054,7 +1003,7 @@ class Lfm2MoeModel(Lfm2MoePreTrainedModel):
 
 @auto_docstring
 class Lfm2MoeForCausalLM(Lfm2MoePreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 

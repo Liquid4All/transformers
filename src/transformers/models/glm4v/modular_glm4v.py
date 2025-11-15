@@ -257,7 +257,7 @@ class Glm4vTextConfig(PreTrainedConfig):
         use_cache: Optional[bool] = True,
         tie_word_embeddings: Optional[bool] = False,
         attention_dropout: Optional[float] = 0.0,
-        rope_parameters: Optional[RopeParameters | dict[RopeParameters]] = None,
+        rope_parameters: Optional[RopeParameters | dict[str, RopeParameters]] = None,
         image_token_id: Optional[int] = None,
         video_token_id: Optional[int] = None,
         **kwargs,
@@ -1341,14 +1341,11 @@ class Glm4vForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         pixel_values_videos: Optional[torch.FloatTensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
-        rope_deltas: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Glm4vCausalLMOutputWithPast]:
         r"""
-        rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
-            The rope index difference between sequence length and multimodal rope.
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
@@ -1545,8 +1542,6 @@ class Glm4vProcessor(Qwen2VLProcessor):
             in a chat into a tokenizable string.
     """
 
-    tokenizer_class = ("PreTrainedTokenizer", "PreTrainedTokenizerFast")
-
     def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
         super().__init__(image_processor, tokenizer, video_processor, chat_template=chat_template)
         self.image_token = "<|image|>" if not hasattr(tokenizer, "image_token") else tokenizer.image_token
@@ -1607,7 +1602,7 @@ class Glm4vProcessor(Qwen2VLProcessor):
         if videos is not None:
             videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
             # If user has not requested video metadata, pop it
-            if "return_metadata" not in kwargs:
+            if not kwargs.get("return_metadata"):
                 video_metadata = videos_inputs.pop("video_metadata")
             else:
                 video_metadata = videos_inputs["video_metadata"]
